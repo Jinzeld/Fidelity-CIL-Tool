@@ -6,7 +6,6 @@ import pyotp
 import typing
 from typing import Literal
 import re
-from time import sleep
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_stealth import StealthConfig, stealth_sync
@@ -113,7 +112,8 @@ class FidelityAutomation:
         )
 
         self.context = self.browser.new_context(
-            storage_state=self.profile_path if self.title is not None else None
+            # If we want to save cookies and session data, set a path, else set to None
+            storage_state=self.profile_path if self.save_state else None
         )
 
         # Take screenshots on actions
@@ -224,6 +224,8 @@ class FidelityAutomation:
         -------
         all_stock_dict (dict)
             A dict of stocks that the account has.
+            The dict is keyed by stocks and only has the quantity. 
+            `all_stock_dict[stock] = quantity (int)`
         """
         if account_number in self.account_dict:
             all_stock_dict = {}
@@ -254,7 +256,8 @@ class FidelityAutomation:
             ```
             {
                 'balance': float: Total account balance
-                'type': str: The account nickname or default name
+                'nickname': str: The account nickname or default name
+                "withdrawal_balance": Use get_list_of_accounts() to populate
                 'stocks': list: A list of dictionaries for each stock found. The dict has:
                     {
                         'ticker': str: The ticker of the stock held
@@ -264,103 +267,133 @@ class FidelityAutomation:
                     }
             }
             ```
+        None
+            If an error occurred
         """
-        # Go to positions page
-        self.page.wait_for_load_state(state="load")
-        self.page.goto("https://digital.fidelity.com/ftgw/digital/portfolio/positions")
-        self.wait_for_loading_sign()
-
-        # Download the positions as a csv
-        with self.page.expect_download() as download_info:
-            self.page.get_by_label("Download Positions").click()
-        download = download_info.value
-        cur = os.getcwd()
-        positions_csv = os.path.join(cur, download.suggested_filename)
-        # Create a copy to work on with the proper file name known
-        download.save_as(positions_csv)
-
-        csv_file = open(positions_csv, newline="", encoding="utf-8-sig")
-
-        reader = csv.DictReader(csv_file)
-        # Ensure all fields we want are present
-        required_elements = [
-            "Account Number",
-            "Account Name",
-            "Symbol",
-            "Description",
-            "Quantity",
-            "Last Price",
-            "Current Value",
-        ]
-        intersection_set = set(reader.fieldnames).intersection(set(required_elements))
-        if len(intersection_set) != len(required_elements):
-            raise Exception("Not enough elements in fidelity positions csv")
-
-        for row in reader:
-            # Skip empty rows
-            if row["Account Number"] is None:
-                continue
-            # Last couple of rows have some disclaimers, filter those out
-            if "and" in row["Account Number"]:
-                break
-            # Skip accounts that start with 'Y' (Fidelity managed)
-            if row["Account Number"][0] == "Y":
-                continue
-            # Get the value and remove '$' from it
-            val = str(row["Current Value"]).replace("$", "").replace("-", "")
-            # Get the last price
-            last_price = str(row["Last Price"]).replace("$", "").replace("-", "")
-            # Get quantity
-            quantity = str(row["Quantity"]).replace("-", "")
-            # Get ticker
-            ticker = str(row["Symbol"])
-
-            # Don't include this if present
-            if "Pending" in ticker:
-                continue
-            # If the value isn't present, move to next row
-            if len(val) == 0:
-                continue
-            # If the last price isn't available, just use the current value
-            if len(last_price) == 0:
-                last_price = val
-            # If the quantity is missing set it to 1 (For SPAXX or any other cash position)
-            if len(quantity) == 0:
-                quantity = 1
+        try:
+            # Go to positions page
+            self.page.wait_for_load_state(state="load")
+            self.page.goto("https://digital.fidelity.com/ftgw/digital/portfolio/positions")
             
-            # Check for anything that isn't a number 
-            try:
-                float(val)
-            except ValueError:
-                val = 0
-            try:
-                float(last_price)
-            except ValueError:
-                last_price = 0
-            try:
-                float(quantity)
-            except ValueError:
-                quantity = 0
+            # This double wait is necessary. If you remove it, I'll kill you
+            self.wait_for_loading_sign()
+            self.page.wait_for_timeout(1000)
+            # Sometimes this can take a while to load. Set to 2.5 minutes
+            self.wait_for_loading_sign(timeout=2.5*60*1000)
 
-            # Create list of dictionary for stock found
-            stock_list = [create_stock_dict(ticker, float(quantity), float(last_price), float(val))]
-            # Try setting in the account dict without overwrite
-            if not self.set_account_dict(
-                account_num=row["Account Number"],
-                balance=float(val),
-                nickname=row["Account Name"],
-                stocks=stock_list,
-                overwrite=False,
-            ):
-                # If the account exists already, add to it
-                self.add_stock_to_account_dict(row["Account Number"], stock_list[0])
+            # Download the positions as a csv #
+            # See if new UI is present
+            new_ui = True
+            try:
+                self.page.get_by_role("button", name="Available Actions").click(timeout=8000)
+                with self.page.expect_download() as download_info:
+                    self.page.get_by_role("menuitem", name="Download").click()
+                download = download_info.value
+            except PlaywrightTimeoutError:
+                new_ui = False
+            if not new_ui:
+                try:
+                    # Use the old UI
+                    with self.page.expect_download() as download_info:
+                        self.page.get_by_label("Download Positions").click(timeout=8000)
+                    download = download_info.value
+                except PlaywrightTimeoutError:
+                    print("Could not get positions csv")
+                    return None
+            # Get absolute path to file
+            cur = os.getcwd()
+            positions_csv = os.path.join(cur, download.suggested_filename)
+            # Create a copy to work on with the proper file name known
+            download.save_as(positions_csv)
 
-        # Close the file
-        csv_file.close()
-        # Delete the file
-        os.remove(positions_csv)
+            csv_file = open(positions_csv, newline="", encoding="utf-8-sig")
 
-        return self.account_dict
+            reader = csv.DictReader(csv_file)
+            # Ensure all fields we want are present
+            required_elements = [
+                "Account Number",
+                "Account Name",
+                "Symbol",
+                "Description",
+                "Quantity",
+                "Last Price",
+                "Last Price Change",
+                "Current Value",
+            ]
+            intersection_set = set(reader.fieldnames).intersection(set(required_elements))
+            if len(intersection_set) != len(required_elements):
+                raise Exception("Not enough elements in fidelity positions csv")
+
+            for row in reader:
+                # Skip empty rows
+                if row["Account Number"] is None:
+                    continue
+                # Last couple of rows have some disclaimers, filter those out
+                if "and" in row["Account Number"]:
+                    break
+                # Skip accounts that start with 'Y' (Fidelity managed)
+                if row["Account Number"][0] == "Y":
+                    continue
+                # Get the value and remove '$' from it
+                cur_val = str(row["Current Value"]).replace("$", "").replace("-", "")
+                # Get the last price
+                last_price = str(row["Last Price"]).replace("$", "").replace("-", "")
+                # Get the last price change
+                last_price_change = str(row["Last Price Change"]).replace("$", "")
+                # Get quantity
+                quantity = str(row["Quantity"]).replace("-", "")
+                # Get ticker
+                ticker = str(row["Symbol"])
+
+                # Catch any pending activity with special handling
+                if "Pending" in ticker:
+                    cur_val = last_price_change
+                # If the value isn't present, move to next row
+                if len(cur_val) == 0:
+                    continue
+                # If the last price isn't available, just use the current value
+                if len(last_price) == 0:
+                    last_price = cur_val
+                # If the quantity is missing set it to 1 (For SPAXX or any other cash position)
+                if len(quantity) == 0:
+                    quantity = 1
+                
+                # Check for anything that isn't a number 
+                try:
+                    float(cur_val)
+                except ValueError:
+                    cur_val = 0
+                try:
+                    float(last_price)
+                except ValueError:
+                    last_price = 0
+                try:
+                    float(quantity)
+                except ValueError:
+                    quantity = 0
+
+                # Create list of dictionary for stock found
+                stock_list = [create_stock_dict(ticker, float(quantity), float(last_price), float(cur_val))]
+                # Try setting in the account dict without overwrite
+                if not self.set_account_dict(
+                    account_num=row["Account Number"],
+                    balance=float(cur_val),
+                    nickname=row["Account Name"],
+                    stocks=stock_list,
+                    overwrite=False,
+                ):
+                    # If the account exists already, add to it
+                    self.add_stock_to_account_dict(row["Account Number"], stock_list[0])
+
+            # Close the file
+            csv_file.close()
+            # Delete the file
+            os.remove(positions_csv)
+
+            return self.account_dict
+        except Exception as e:
+            print(f"Error in getAccountInfo: {e}")
+            return None
 
     def set_account_dict(self, account_num: str, balance: float = None, withdrawal_balance: float = None, nickname: str = None, stocks: list = None, overwrite: bool = False):
         """
@@ -415,8 +448,8 @@ class FidelityAutomation:
 
             # Use the info given
             self.account_dict[account_num] = {
-                "balance": balance if balance is not None else 0.0,
-                "withdrawal_balance": withdrawal_balance if withdrawal_balance is not None else 0.0,
+                "balance": round(balance, 2) if balance is not None else 0.0,
+                "withdrawal_balance": round(withdrawal_balance, 2) if withdrawal_balance is not None else 0.0,
                 "nickname": nickname,
                 "stocks": stocks if stocks is not None else []
             }
@@ -441,10 +474,10 @@ class FidelityAutomation:
         if account_num in self.account_dict:
             if overwrite:
                 self.account_dict[account_num]["stocks"] = [stock]
-                self.account_dict[account_num]["balance"] = stock["value"]
+                self.account_dict[account_num]["balance"] = round(stock["value"], 2)
             else:
                 self.account_dict[account_num]["stocks"].append(stock)
-                self.account_dict[account_num]["balance"] += stock["value"]
+                self.account_dict[account_num]["balance"] += round(stock["value"], 2)
             return True
         return False
 
@@ -512,7 +545,7 @@ class FidelityAutomation:
         # Stop the instance of playwright
         self.playwright.stop()
 
-    def login(self, username: str, password: str, totp_secret: str = None, save_device: bool = True) -> bool:
+    def login(self, username: str, password: str, totp_secret: str = None, save_device: bool = False) -> tuple[bool, bool]:
         """
         Logs into fidelity using the supplied username and password.
 
@@ -547,6 +580,10 @@ class FidelityAutomation:
         """
         try:
             # Go to the login page
+            self.page.goto(url="https://digital.fidelity.com/prgw/digital/login/full-page")
+
+            self.page.wait_for_timeout(5000)
+
             self.page.goto(url="https://digital.fidelity.com/prgw/digital/login/full-page")
             
             # Login page
@@ -635,6 +672,7 @@ class FidelityAutomation:
 
         except PlaywrightTimeoutError:
             print("Timeout waiting for login page to load or navigate.")
+            traceback.print_exc()
             return (False, False)
         except Exception as e:
             print(f"An error occurred: {str(e)}")
@@ -729,12 +767,15 @@ class FidelityAutomation:
 
         return unique_stocks
 
-    def transaction(self, stock: str, quantity: float, action: str, account: str, dry: bool = True) -> bool:
+    def transaction(self, stock: str, quantity: float, action: str, account: str, dry: bool = True, limit_price: float = None) -> bool:
         """
-        Process an order (transaction) using the dedicated trading page.
+        Process an order (transaction) using the dedicated trading page. Support extended hour trading.
 
         `NOTE`: If you use this function repeatedly but change the stock between ANY call,
-        RELOAD the page before calling this
+        RELOAD the page before calling this. You can do this like so:
+        ```
+        FidelityAutomation.page.reload()
+        ```
 
         For buying:
             If the price of the security is below $1, it will choose limit order and go off of the last price + a little
@@ -768,26 +809,33 @@ class FidelityAutomation:
 
             # Click on the drop down
             self.page.query_selector("#dest-acct-dropdown").click()
+            
+            # Define a more specific locator that targets the button specifically
+            # Based on your error log, the button ITSELF has role="option", so use this one:
+            account_locator = self.page.locator("button[role='option']").filter(has_text=account.upper())
 
-            if (not self.page.get_by_role("option").filter(has_text=account.upper()).is_visible()):
+            if (not account_locator.is_visible()):
                 # Reload the page and hit the drop down again
-                # This is to prevent a rare case where the drop down is empty
                 print("Reloading...")
                 self.page.reload()
-                # Click on the drop down
                 self.page.query_selector("#dest-acct-dropdown").click()
-            # Find the account to trade under
-            self.page.get_by_role("option").filter(has_text=account.upper()).click()
+                
+            # Click the specific account button
+            account_locator.click()
+            
+            self.page.wait_for_timeout(3000)
 
             # Enter the symbol
-            self.page.get_by_label("Symbol").click()
+            self.page.get_by_label("Symbol", exact=True).click()
             # Fill in the ticker
-            self.page.get_by_label("Symbol").fill(stock)
+            self.page.get_by_label("Symbol", exact=True).fill(stock)
             # Force the search to use exactly what was entered
-            self.page.get_by_label("Symbol").press("Enter")
+            self.page.get_by_label("Symbol", exact=True).press("Enter")
 
             # Wait for quote panel to show up
             self.page.locator("#quote-panel").wait_for(timeout=5000)
+            
+            # Get initial price (this might be closing price)
             last_price = self.page.query_selector("#eq-ticket__last-price > span.last-price").text_content()
             last_price = last_price.replace("$", "")
 
@@ -797,29 +845,84 @@ class FidelityAutomation:
                 # Wait for it to take effect
                 self.page.get_by_role("button", name="Calculate shares").wait_for(timeout=5000)
 
-            # When enabling extended hour trading
+            # --- EXTENDED HOURS LOGIC ---
             extended = False
             precision = 3
-            # Enable extended hours trading if available
-            if self.page.get_by_text("Extended hours trading").is_visible():
+
+            # Check for the specific Extended Hours button provided
+            # We locate the wrapper because it holds the state class (pvd-switch--on)
+            extended_wrapper = self.page.locator(".eq-ticket__extendedhour-toggle")
+            extended_btn = self.page.locator("#eq-ticket_extendedhour")
+            
+            if extended_btn.is_visible():
+                # Check if it is already toggled on using the wrapper class
+                class_attr = extended_wrapper.first.get_attribute("class")
+                if class_attr and "pvd-switch--on" in class_attr:
+                    print("Extended Hours Trading is already active.")
+                else:
+                    print("Enabling Extended Hours Trading...")
+                    extended_btn.click()
+                    # Wait for the toggle animation and price update
+                    self.page.wait_for_timeout(1000)
+                
+                extended = True
+                precision = 2
+
+                # Refresh the price! The UI likely switched from Closing Price to Ext Hrs Price
+                if self.page.locator("#eq-ticket__last-price > span.last-price").is_visible():
+                    new_price = self.page.query_selector("#eq-ticket__last-price > span.last-price").text_content()
+                    last_price = new_price.replace("$", "").replace(",", "")
+
+            # Fallback to old text-based check if the button ID changes or isn't present
+            elif self.page.get_by_text("Extended hours trading").is_visible():
                 if self.page.get_by_text("Extended hours trading: OffUntil 8:00 PM ET").is_visible():
                     self.page.get_by_text("Extended hours trading: OffUntil 8:00 PM ET").check()
                 extended = True
                 precision = 2
+            # --- END EXTENDED HOURS LOGIC ---
 
             # Press the buy or sell button. Title capitalizes the first letter so 'buy' -> 'Buy'
-            self.page.query_selector(".eq-ticket-action-label").click()
-            self.page.get_by_role("option", name=action.lower().title(), exact=True).wait_for()
-            self.page.get_by_role("option", name=action.lower().title(), exact=True).click()
+            # Define the elements
+            action_dropdown = self.page.locator(".eq-ticket-action-label")
+            target_option = self.page.get_by_role("option", name=action.lower().title(), exact=True)
+
+            # Retry loop: If the "Buy" button detaches or isn't found, we re-click the menu.
+            for attempt in range(5):
+                try:
+                    # 1. Open the menu
+                    # We use force=True to click through any transparent loading masks
+                    if not target_option.is_visible():
+                        action_dropdown.click(force=True)
+                        # Small wait for animation
+                        self.page.wait_for_timeout(500)
+
+                    # 2. Try to click the option (Buy/Sell)
+                    # We reduce timeout to 3s so we can fail fast and retry opening the menu
+                    target_option.click(timeout=3000)
+                    
+                    # If we get here, it worked. Break the loop.
+                    break
+                
+                except (PlaywrightTimeoutError, Exception) as e:
+                    print(f"Attempt {attempt+1} failed to click '{action}': {e}")
+                    print("Re-opening menu and retrying...")
+                    # Wait a moment before trying again to let any DOM updates settle
+                    self.page.wait_for_timeout(1000)
+            else:
+                # This executes if the loop finishes without breaking (all 5 attempts failed)
+                return (False, f"Could not select '{action}' after 5 attempts. Menu stuck.")
 
             # Press the shares text box
             self.page.locator("#eqt-mts-stock-quatity div").filter(has_text="Quantity").click()
             self.page.get_by_text("Quantity", exact=True).fill(str(quantity))
 
             # If it should be limit
-            if float(last_price) < 1 or extended:
+            if float(last_price) < 1 or extended or limit_price is not None:
+                # Set if present
+                if limit_price is not None:
+                    wanted_price = limit_price
                 # Buy above
-                if action.lower() == "buy":
+                elif action.lower() == "buy":
                     difference_price = 0.01 if float(last_price) > 0.1 else 0.0001
                     wanted_price = round(float(last_price) + difference_price, precision)
                 # Sell below
@@ -911,7 +1014,6 @@ class FidelityAutomation:
             return (False, f"Driver timed out. Order not complete: {toe}")
         except Exception as e:
             return (False, f"Some error occurred: {e}")
-        
 
     def open_account(self, type: typing.Optional[Literal["roth", "brokerage"]]) -> bool:
         """
@@ -962,8 +1064,12 @@ class FidelityAutomation:
                     self.wait_for_loading_sign()
 
                 # If application is already started, then there will only be 1 "Next" button
-                self.page.get_by_role("button", name="Next").click()
-                self.wait_for_loading_sign()
+                # Rarely there will be no "Next" button
+                try:
+                    self.page.get_by_role("button", name="Next").click(timeout=15000)
+                    self.wait_for_loading_sign()
+                except:
+                    pass
                 
                 # Open account
                 self.page.get_by_role("button", name="Open account").click()
@@ -983,7 +1089,6 @@ class FidelityAutomation:
                     # If new account is found, collect and return
                     if new_dict_acc not in old_dict:
                         self.new_account_number = new_dict_acc
-                        print(self.new_account_number)
                         return True
                 
                 # No new account number was found, return false
@@ -1056,6 +1161,7 @@ class FidelityAutomation:
             available_balance = float(available_balance.replace("$", "").replace(",", ""))
 
             # Check if there's enough balance
+            transfer_amount = round(transfer_amount, 2)
             if transfer_amount > available_balance:
                 print(f"Insufficient funds. Available: ${available_balance}, Attempted transfer: ${transfer_amount}")
                 return False
@@ -1081,7 +1187,7 @@ class FidelityAutomation:
         except Exception as e:
             print(f"An error occurred during the transfer: {str(e)}")
             return False
-        
+
     def transfer_from_source_to_all_acc(self, source_account: str, transfer_amount: float) -> bool:
         """
         Transfers specified amount from source account to all eligible destination accounts.
@@ -1324,7 +1430,6 @@ class FidelityAutomation:
         except Exception as e:
             print(f"An error occurred during transfers: {str(e)}")
             return False
-    
 
     def enable_pennystock_trading(self, account: str) -> bool:
         """
@@ -1358,16 +1463,17 @@ class FidelityAutomation:
             self.page.wait_for_load_state(state="load", timeout=30000)
             self.wait_for_loading_sign()
 
-            # Wait for and click the Start button else skip
-            startbtn = self.page.get_by_role("button", name="Start")
-            if startbtn:
-                startbtn.wait_for(timeout=15000)
-                startbtn.click()
-            else:
-                pass
-            self.page.reload()
+            # Wait for and click the Start button
+            self.page.get_by_role("button", name="Start").click(timeout=15000)
             self.wait_for_loading_sign()
 
+            # See if we can enable any accounts
+            try:
+                self.page.get_by_text("This feature is already enabled").wait_for(state="visible", timeout=1000)
+                print("All accounts have penny stock trading enabled already")
+                return True
+            except PlaywrightTimeoutError:
+                pass
             # Ensure the page is loaded
             select_account_title = self.page.get_by_role("heading", name="Select an account")
             select_account_title.wait_for(timeout=30000, state="visible")
@@ -1379,8 +1485,6 @@ class FidelityAutomation:
             if self.page.locator("label").filter(has_text=account).is_visible():
                 # This seems to never work for checkbox version so reload and try for dropdown version
                 self.page.locator("label").filter(has_text=account).click()
-            else:
-                pass
 
             # Dropdown version
             if self.page.get_by_label("Your eligible accounts").is_visible():
@@ -1407,7 +1511,7 @@ class FidelityAutomation:
                 # self.page.wait_for_url(url="https://digital.fidelity.com/ftgw/digital/easy/hrt/pst/termsandconditions")
                 # TODO This is the page that it navigates to after the checkbox version
                 # https://digital.fidelity.com/ftgw/digital/brokerage-host/psta/TermsAndCondtions
-                # Also the page doesnt say success if it goes here. it says You're all set!. See pic in downloads
+                # Also the page doesn't say success if it goes here. it says You're all set!. See pic in downloads
             except PlaywrightTimeoutError as e:
                 if not "termsandconditions" in self.page.url.lower():
                     raise Exception(e)
@@ -1430,157 +1534,127 @@ class FidelityAutomation:
         except Exception as e:
             print(f"Error: {e}")
             return False
-        
-    def enable_all_pennystock_trading(self) -> bool:
-        """
-        Enables penny stock trading for all eligible accounts shown in the dropdown.
-
-        NOTE: Use login(save_device=False) when logging in.
-        If you do not authenticate with 2FA when creating this session and the device is remembered from a previous
-        login, fidelity can attempt to authenticate again which causes this function to fail.
-
-        Returns
-        -------
-        bool
-            True if all accounts were successfully enabled, False otherwise
-        """
-        try:
-            self.page.wait_for_load_state(state="load")
-            self.page.goto(url="https://digital.fidelity.com/ftgw/digital/portfolio/features")
-            sleep(1)
-            self.page.get_by_label("Manage Penny Stock Trading").click()
-            sleep(1)
-            self.page.wait_for_load_state(state="load", timeout=30000)
-            self.wait_for_loading_sign()
-            sleep(4)
-            self.page.reload()
-        
-            # Wait for and click the Start button
-            startbtn = self.page.get_by_role("button", name="Start")
-            if startbtn:
-                startbtn.wait_for(timeout=15000)
-                startbtn.click()
-            else:
-                pass
-            self.page.reload()
-            self.wait_for_loading_sign()
-            sleep(3)
-            self.page.reload()
-
-            # Ensure the page is loaded
-            select_account_title = self.page.get_by_role("heading", name="Select an account")
-            select_account_title.wait_for(timeout=30000, state="visible")
-            self.page.reload()
-
-            # Get the dropdown if it exists
-            dropdown = self.page.get_by_label("Your eligible accounts")
-            if dropdown.is_visible():
-                # Get all options from dropdown
-                options = dropdown.locator("option").all()
-                
-                # Enable for each account
-                for option in options:
-                    account_number = option.get_attribute("value")
-                    if not account_number:  # Skip empty/placeholder options
-                        continue
-                    
-                    # Select the account
-                    dropdown.select_option(account_number)
-                    sleep(1)
-                    
-                    # Continue with enabling
-                    self.page.get_by_role("button", name="Continue").click()
-                    self.wait_for_loading_sign(timeout=60000)
-                    
-                    # Wait for terms page
-                    self.page.wait_for_load_state(state="load")
-                    self.wait_for_loading_sign()
-                    
-                    # Verify we're on terms page
-                    if ("https://digital.fidelity.com/ftgw/digital/easy/hrt/pst/termsandconditions" not in self.page.url and 
-                        "https://digital.fidelity.com/ftgw/digital/brokerage-host/psta/TermsAndCondtions" not in self.page.url
-                    ):
-                        print(f"Failed to enable penny stock trading for account {account_number}")
-                        return False
-
-                    # Accept the risks
-                    self.page.query_selector(".pvd-checkbox__label").click()
-                    sleep(1)
-                    self.page.get_by_role("button", name="Submit").click()
-                    sleep(1)
-                    self.wait_for_loading_sign()
-                    self.page.wait_for_load_state(state="load")
-                    self.wait_for_loading_sign()
-
-                    # Verify success
-                    try:
-                        success_ribbon = self.page.get_by_text("Your account is now enabled.")
-                        success_ribbon.wait_for(state="visible", timeout=15000)
-                        print(f"Successfully enabled penny stock trading for account {account_number}")
-                    except PlaywrightTimeoutError:
-                        print(f"Could not verify penny stock enabled for account {account_number}")
-                        return False
-
-                    # Go back to features page to enable for next account
-                    self.page.reload()
-                    self.page.goto(url="https://digital.fidelity.com/ftgw/digital/portfolio/features")
-                    self.page.get_by_label("Manage Penny Stock Trading").click()
-                    self.wait_for_loading_sign()
-                    self.page.get_by_role("button", name="Start").click(timeout=15000)
-                    self.page.reload()
-                    self.wait_for_loading_sign()
-
-                return True
-
-            else:
-                print("Dropdown menu not found")
-                return False
-
-        except Exception as e:
-            print(f"Error: {e}")
-            return False
     
-    def download_prev_statement(self, date: str):
+    def download_statements(self, date: str):
         """
-        Downloads the multi-account statement for the given month.
-        TODO: feature that goes to certain year or period if given date is more than 6 months before current date
-        TODO: ranges of date matching. Fidelity sometimes combines statements of months. Ex: Jan - April
+        Downloads the account statement(s) for the given month.
 
         Parameters
         ----------
         date (str)
-            The month and year for the statement to download. Format of `MM/YYYY`
+            The month and year for the statement to download. Format of `YYYY/MM`  Ex: 2019/01
         
         Returns
         -------
-        statement (str)
-            The full path of the file downloaded
+        saved_files (str)
+            A list of absolute file paths to statements downloaded. If error occurred, return None
         """
 
         # Trim date down
-        month = date[:2]
-        year = date[-4:]
+        target_month = date[-2:]
+        target_year = date[:4]
+        if not target_month.isdigit() or not target_year.isdigit():
+            return None
+        target_month = int(target_month)
+        target_year = int(target_year)
 
-        # Convert to month
-        month = fid_months(int(month)).name
+        # Convert to target_month string
+        fid_month = fid_months(target_month).name
 
-        # Build statement name string
-        beginning = str(month) + " " + year
-        # Convert to 3 letter month followed by year
+        def beneficiary_popup_close():
+            self.page.get_by_role("button", name="Close dialog").click()
+            return True
+
+        # Setup popup handler
+        self.page.add_locator_handler(
+            self.page.locator(".pvd3-cim-modal-root > .pvd-modal__overlay"),
+            beneficiary_popup_close,
+        )
+
+        # Go to url
         self.page.wait_for_load_state(state="load")
         self.page.goto(url="https://digital.fidelity.com/ftgw/digital/portfolio/documents/dochub")
-        self.page.get_by_role("row", name=f"{beginning} — Statement (pdf)").get_by_label("download statement").click()
-        with self.page.expect_download() as download_info:
-            with self.page.expect_popup() as page1_info:
-                self.page.get_by_role("menuitem", name="Download as PDF").click()
-            page1 = page1_info.value
-        download = download_info.value
-        cur = os.getcwd()
-        statement = os.path.join(cur, download.suggested_filename)
-        # Create a copy to work on with the proper file name known
-        download.save_as(statement)
-        page1.close()
-        return statement
+
+        # Select the proper year
+        # Select the date change button
+        self.page.get_by_role("button", name="Changing").click(timeout=5000)
+
+        # Choose the corresponding year
+        self.page.get_by_role("menuitem", name=f"{str(target_year)}").click(timeout=5000)
+
+        # Wait for entries to load
+        self.page.locator("statements-loading-skeleton div").nth(1).wait_for(state="hidden")
+
+        # expand results or end if no results
+        if self.page.get_by_text("There are no statements").is_visible():
+            return None
+
+        # If statement is not showing, expand if possible
+        elif self.page.get_by_role("button", name="Load more results").is_visible():
+            try:
+                self.page.get_by_role("button", name="Load more results").click(timeout=5000)
+            except PlaywrightTimeoutError:
+                if not self.page.get_by_text("Showing all results").is_visible():
+                    return None
+
+        # If everything is showing, continue
+        elif not self.page.get_by_text("Showing all results").is_visible():
+            return None
+
+        # Get list of elements
+        # Wait for entries to load and filter themselves out
+        self.page.wait_for_timeout(1000)
+        items = self.page.get_by_role("row").all()
+        valid_rows = []
+        for item in items:
+            text = item.inner_text()
+            # Double check that text contains target_year
+            if not re.search(str(target_year), text):
+                continue
+            # If we find a direct match, add to valid rows and continue
+            if re.search(fid_month, text):
+                valid_rows.append(item)
+                continue
+
+            # Otherwise, do more processing
+            found_months = []
+            for month in fid_months.__members__.keys():
+                if len(found_months) >= 2:
+                    break
+                result = re.search(str(month), text)
+                if result:
+                    found_months.append(month)
+
+            # If, for whatever reason, we didn't find 2 months, just go to the next item
+            if len(found_months) != 2:
+                continue
+            # Determine if target date is in this statement period
+            if fid_months[found_months[0]].value <= target_month and target_month <= fid_months[found_months[1]].value:
+                valid_rows.append(item)
+
+        saved_files = []
+        # Determine sub folder name if necessary
+        subfolder = ""
+        if self.title is not None:
+            subfolder = self.title + '/'
+        for row in valid_rows:
+            # Download matches
+            with self.page.expect_download() as download_info:
+                with self.page.expect_popup() as page1_info:
+                    row.filter(has=self.page.get_by_role("link")).click(timeout=5000)
+                page1 = page1_info.value
+            download = download_info.value
+            filename = f"./Statements/{subfolder}{str(len(saved_files))} - {download.suggested_filename}"
+            if not os.path.exists(os.path.dirname(filename)):
+                os.makedirs(os.path.dirname(filename), exist_ok=True)
+            cur = os.getcwd()
+            filename = os.path.join(cur, filename)
+            # Create a copy to work on with the proper file name known
+            download.save_as(filename)
+            page1.close()
+            saved_files.append(filename)
+        # return a list of filenames
+        return saved_files
 
     def wait_for_loading_sign(self, timeout: int = 30000):
         """
@@ -1597,6 +1671,7 @@ class FidelityAutomation:
         signs = [self.page.locator("div:nth-child(2) > .loading-spinner-mask-after").first,
                  self.page.locator(".pvd-spinner__mask-inner").first,
                  self.page.locator("pvd-loading-spinner").first,
+                 self.page.locator(".pvd3-spinner-root > .pvd-spinner__spinner > .pvd-spinner__visual > div > .pvd-spinner__mask-inner").first,
                 ]
         for sign in signs:
             sign.wait_for(timeout=timeout, state="hidden")
@@ -1611,6 +1686,11 @@ class FidelityAutomation:
             The account number for the account to be nicknamed. Ex: `Z12345678`
         nickname (str)
             The nickname to use
+            
+        Returns
+        -------
+        Success (bool)
+            True if successful, false otherwise
         """
         try:
             # Get to summary page
@@ -1643,7 +1723,9 @@ class FidelityAutomation:
                 return False
 
             # Click it
+            self.page.wait_for_timeout(500)
             selected_entry.click()
+            self.page.wait_for_timeout(500)
 
             # Click the rename button
             self.page.get_by_role("button", name="Rename").click()
@@ -1664,7 +1746,6 @@ class FidelityAutomation:
         except Exception as e:
             print(e)
             return False
-
 
 def create_stock_dict(ticker: str, quantity: float, last_price: float, value: float, stock_list: list = None):
     """
